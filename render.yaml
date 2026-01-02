@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: flask-php-service
+    env: docker
+    branch: main
+    plan: free
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: PORT
+        value: "5000"
