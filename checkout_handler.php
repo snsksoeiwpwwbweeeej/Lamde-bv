@@ -9,23 +9,28 @@ class BikeAttackCheckout {
     private $billingAddressId;
     private $orderId;
     private $jwtToken;
-    private $creditCardNumber; // <<< 1. NEW PROPERTY
+    private $creditCardNumber;
     private $userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36';
     private $productId = '5074';
     private $attributeId = '21013';
     private $attributeValue = '525';
     private $quantity = '1';
     private $debug = true;
+    private $useCurl = true;
     
-    // <<< 2. MODIFIED CONSTRUCTOR
     public function __construct($cc = null) {
         $this->cookieJar = tempnam(sys_get_temp_dir(), 'cookie');
-        // Use the provided CC, or a default test number if none is given
         $this->creditCardNumber = $cc ?? '4111111111111111'; 
         $this->generateRandomTokens();
+        
+        // Check if cURL is available
+        if (!function_exists('curl_init')) {
+            $this->useCurl = false;
+            $this->debugOutput("WARNING: cURL is not available. Using fallback method.");
+            $this->debugOutput("For better performance, install PHP cURL: sudo apt-get install php-curl");
+        }
     }
     
-
     private function generateRandomTokens() {
         $this->orderId = rand(10000, 99999);
     }
@@ -44,17 +49,9 @@ class BikeAttackCheckout {
         return $this->generateRandomString(8) . '@' . $this->generateRandomString(5) . '.com';
     }
     
-
     private function generateRandomPhoneNumber() {
         return '0' . rand(100000000, 999999999);
     }
-
-    // This function is no longer needed as we pass the CC in the constructor
-    /*
-    private function generateRandomCreditCardNumber() {
-        return '4111111111111111';
-    }
-    */
 
     private function generateRandomExpiryDate() {
         return [
@@ -91,6 +88,14 @@ class BikeAttackCheckout {
     }
     
     private function makeRequest($url, $method, $headers = [], $postFields = null, $isMultipart = false) {
+        if ($this->useCurl) {
+            return $this->makeRequestCurl($url, $method, $headers, $postFields, $isMultipart);
+        } else {
+            return $this->makeRequestFallback($url, $method, $headers, $postFields, $isMultipart);
+        }
+    }
+    
+    private function makeRequestCurl($url, $method, $headers = [], $postFields = null, $isMultipart = false) {
         $ch = curl_init();
         curl_setopt($ch, CURLOPT_URL, $url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -103,6 +108,7 @@ class BikeAttackCheckout {
         curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
         
         if ($postFields) {
             if ($isMultipart) {
@@ -121,7 +127,12 @@ class BikeAttackCheckout {
         }
         
         $response = curl_exec($ch);
+        $error = curl_error($ch);
         $info = curl_getinfo($ch);
+        
+        if ($error) {
+            $this->debugOutput("cURL Error: " . $error);
+        }
         
         $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
         $header = substr($response, 0, $headerSize);
@@ -134,8 +145,103 @@ class BikeAttackCheckout {
         return [
             'header' => $header,
             'body' => $body,
-            'info' => $info
+            'info' => $info,
+            'error' => $error
         ];
+    }
+    
+    private function makeRequestFallback($url, $method, $headers = [], $postFields = null, $isMultipart = false) {
+        // Prepare headers
+        $headerString = '';
+        foreach ($headers as $header) {
+            $headerString .= $header . "\r\n";
+        }
+        
+        // Create stream context options
+        $options = [
+            'http' => [
+                'method' => $method,
+                'header' => $headerString,
+                'ignore_errors' => true,
+                'timeout' => 30,
+                'follow_location' => 1,
+                'user_agent' => $this->userAgent
+            ],
+            'ssl' => [
+                'verify_peer' => false,
+                'verify_peer_name' => false
+            ]
+        ];
+        
+        // Add post data if present
+        if ($postFields && $method !== 'GET') {
+            if ($isMultipart) {
+                $options['http']['content'] = $postFields;
+            } else {
+                if (is_array($postFields)) {
+                    if (strpos($headerString, 'application/json') !== false) {
+                        $options['http']['content'] = json_encode($postFields);
+                    } else {
+                        $options['http']['content'] = http_build_query($postFields);
+                    }
+                } else {
+                    $options['http']['content'] = $postFields;
+                }
+            }
+        }
+        
+        // Handle cookies
+        if (file_exists($this->cookieJar)) {
+            $cookies = file_get_contents($this->cookieJar);
+            if (!empty(trim($cookies))) {
+                $options['http']['header'] .= "Cookie: " . trim($cookies) . "\r\n";
+            }
+        }
+        
+        $context = stream_context_create($options);
+        
+        // Make the request
+        $response = @file_get_contents($url, false, $context);
+        
+        if ($response === FALSE) {
+            $error = error_get_last();
+            $this->debugOutput("HTTP Request Error: " . ($error['message'] ?? 'Unknown error'));
+            return [
+                'header' => '',
+                'body' => '',
+                'info' => [],
+                'error' => $error['message'] ?? 'Request failed'
+            ];
+        }
+        
+        // Extract response headers
+        $responseHeaders = $http_response_header ?? [];
+        $header = implode("\r\n", $responseHeaders);
+        
+        // Save cookies from response
+        $this->saveCookiesFromHeaders($responseHeaders);
+        
+        $this->extractTokensFromResponse($header, $response);
+        
+        return [
+            'header' => $header,
+            'body' => $response,
+            'info' => [],
+            'error' => null
+        ];
+    }
+    
+    private function saveCookiesFromHeaders($headers) {
+        $cookies = '';
+        foreach ($headers as $header) {
+            if (stripos($header, 'Set-Cookie:') === 0) {
+                $cookies .= $header . "\n";
+            }
+        }
+        
+        if (!empty($cookies)) {
+            file_put_contents($this->cookieJar, $cookies);
+        }
     }
     
     private function extractTokensFromResponse($header, $body) {
@@ -164,7 +270,6 @@ class BikeAttackCheckout {
             $this->debugOutput("Extracted Billing Address ID: " . $this->billingAddressId);
         }
         
-
         if (preg_match('/"id":(\d+),"isComplete"/', $body, $matches)) {
             $this->orderId = $matches[1];
             $this->debugOutput("Extracted Order ID: " . $this->orderId);
@@ -190,15 +295,14 @@ class BikeAttackCheckout {
         
         $result = $this->makeRequest($url, 'GET', $headers);
         
-
         if (preg_match('/<meta name="csrf-token" content="([^"]+)"/', $result['body'], $matches)) {
             $this->csrfToken = $matches[1];
             $this->debugOutput("Extracted CSRF Token from meta tag: " . $this->csrfToken);
         }
         
         echo "Initial tokens obtained.\n";
-        echo "CSRF Token: " . $this->csrfToken . "\n";
-        echo "XSRF Token: " . $this->xsrfToken . "\n";
+        echo "CSRF Token: " . ($this->csrfToken ?? 'Not found') . "\n";
+        echo "XSRF Token: " . ($this->xsrfToken ?? 'Not found') . "\n";
         
         return $result;
     }
@@ -356,14 +460,12 @@ class BikeAttackCheckout {
         if (!$this->cartId || !$this->billingAddressId) {
             echo "Cart ID or Billing Address ID is missing. Cannot update billing address.\n";
             
-
             if (!$this->billingAddressId && $this->cartId) {
                 $this->debugOutput("Attempting to create a billing address first...");
                 $this->addBillingAddress();
             }
             
             if (!$this->billingAddressId) {
-
                 $this->billingAddressId = $this->generateRandomString(12);
                 $this->debugOutput("Generated random Billing Address ID: " . $this->billingAddressId);
             }
@@ -636,8 +738,7 @@ class BikeAttackCheckout {
                 'credit_card' => [
                     'account_name' => $address['firstName'] . ' ' . $address['lastName'],
                     'month' => $expiryDate['month'],
-                    // <<< 3. MODIFIED TO USE THE CLASS PROPERTY
-                    'number' => $this->creditCardNumber, 
+                    'number' => $this->creditCardNumber,
                     'verification_value' => $this->generateRandomCVV(),
                     'year' => $expiryDate['year']
                 ]
@@ -667,27 +768,54 @@ class BikeAttackCheckout {
     }
     
     public function runCheckoutProcess() {
-        $this->visitHomepage();
-        $this->addToCart();
-        $this->getCheckoutPage();
-        $this->addBillingAddress();
-        $this->updateBillingAddress();
-        $this->updateCheckout();
-        $this->createOrder();
-        $this->processPayment();
+        echo "========================================\n";
+        echo "Starting BikeAttack Checkout Process\n";
+        echo "Using credit card: " . substr($this->creditCardNumber, 0, 4) . "********" . substr($this->creditCardNumber, -4) . "\n";
+        echo "PHP cURL Available: " . ($this->useCurl ? "Yes" : "No (using fallback)") . "\n";
+        echo "========================================\n\n";
+        
+        try {
+            $this->visitHomepage();
+            $this->addToCart();
+            $this->getCheckoutPage();
+            $this->addBillingAddress();
+            $this->updateBillingAddress();
+            $this->updateCheckout();
+            $this->createOrder();
+            $this->processPayment();
+            
+            echo "\n========================================\n";
+            echo "Checkout process completed!\n";
+            echo "========================================\n";
+        } catch (Exception $e) {
+            echo "\n========================================\n";
+            echo "ERROR: Checkout process failed!\n";
+            echo "Error: " . $e->getMessage() . "\n";
+            echo "========================================\n";
+        }
     }
 }
 
-// <<< 4. MODIFIED SCRIPT EXECUTION
-// Check if the command-line argument ($argv[1]) is set
+// Script execution
 $creditCard = $argv[1] ?? null;
 
 if (!$creditCard) {
-    echo "Error: Credit card number not provided.";
-    exit(1); // Exit with an error code
+    echo "Error: Credit card number not provided.\n";
+    echo "Usage: php checkout_handler.php <credit_card_number>\n";
+    exit(1);
 }
 
-$checkout = new BikeAttackCheckout($creditCard);
-$checkout->runCheckoutProcess();
+// Display PHP info
+echo "PHP Version: " . PHP_VERSION . "\n";
+echo "cURL Extension: " . (function_exists('curl_init') ? 'Loaded' : 'Not Loaded') . "\n";
+echo "OpenSSL Extension: " . (extension_loaded('openssl') ? 'Loaded' : 'Not Loaded') . "\n\n";
+
+try {
+    $checkout = new BikeAttackCheckout($creditCard);
+    $checkout->runCheckoutProcess();
+} catch (Exception $e) {
+    echo "Fatal Error: " . $e->getMessage() . "\n";
+    exit(1);
+}
 
 ?>
